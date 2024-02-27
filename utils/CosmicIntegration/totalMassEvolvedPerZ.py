@@ -1,3 +1,4 @@
+from random import sample
 import numpy as np 
 import h5py as h5 #for reading in data
 import os
@@ -87,9 +88,15 @@ def invertCDFbrokenPowerLaw(CDF, x1, x2, x3, x4, a1, a2, a3, C1):
 
 
 
+def loguniform(min, max, size):
+    log10_min, log10_max = np.log10(min), np.log10(max)
+    return np.power(10, np.random.uniform(log10_min, log10_max, size))
+
+
+
 
 def createSampleUniverse(binaryFraction=1., x1=0.01, x2=0.08, x3=0.5, x4=200, a1=-0.3, \
-                            a2=-1.3, a3=-2.3, C1=1, sampleSize=5000000, Mmin=0.01, Mmax=200):
+                            a2=-1.3, a3=-2.3, C1=1, sampleSize=5000000, Mmin=0.01, Mmax=200, Amin=None, Amax=None):
     
     binaryFraction = binaryFraction
 
@@ -105,6 +112,8 @@ def createSampleUniverse(binaryFraction=1., x1=0.01, x2=0.08, x3=0.5, x4=200, a1
     drawM1         = np.random.uniform(CDFmin,CDFmax,sampleSize)
     drawBinary     = np.random.uniform(0,1,sampleSize)
     drawM2         = np.random.uniform(0,1,sampleSize)
+    if Amin is not None and Amax is not None:
+        drawA          = loguniform(Amin,Amax,sampleSize)
 
     #All the arrays we want to fill
     M1 = np.zeros(sampleSize)
@@ -128,7 +137,10 @@ def createSampleUniverse(binaryFraction=1., x1=0.01, x2=0.08, x3=0.5, x4=200, a1
 
     M2[maskBinary] = np.multiply(drawM2[maskBinary],M1[maskBinary])
     #all the ones outside the mask remain zero
-    return M1, M2
+    if Amin is None and Amax is None:
+        return M1, M2
+    else:
+        return M1, M2, drawA[maskBinary]
 
 
 def inverseCDF(C, CDF, index, xmin, xmax):
@@ -150,16 +162,14 @@ def retrieveMassEvolvedPerZ(path):
     m1s = (allSystems['Mass@ZAMS(1)'])[()]
     m2s = (allSystems['Mass@ZAMS(2)'])[()]
     total = []
-    for Z in np.unique(metals):
-        mask = metals == Z
-        total.append(np.sum(m1s[mask]) + np.sum(m2s[mask]))
+    total = m1s + m2s
     f.close()
     return np.array(total)
 
 
 
 def totalMassEvolvedPerZ(path=None, Mlower=None, Mupper=None, binaryFraction=0.7, \
-                         x1=0.01, x2=0.08, x3=0.5, x4=200., a1=-0.3, a2=-1.3, a3=-2.3, C1=1., Mmax=200):
+                         x1=0.01, x2=0.08, x3=0.5, x4=200., a1=-0.3, a2=-1.3, a3=-2.3, C1=1., Mmax=200, Amin=None, Amax=None):
 
     #the default values assume a Kroupa IMF for M1
     if path is None:
@@ -169,16 +179,23 @@ def totalMassEvolvedPerZ(path=None, Mlower=None, Mupper=None, binaryFraction=0.7
     if Mupper is None:
         raise TypeError("\n Need to give upper limit M1 of pythonSubmit")
     
-
-    M1, M2 = createSampleUniverse(binaryFraction=binaryFraction, x1=x1, x2=x2, x3=x3, x4=x4, \
+    if Amin is None and Amax is None:
+        M1, M2 = createSampleUniverse(binaryFraction=binaryFraction, x1=x1, x2=x2, x3=x3, x4=x4, \
                                   a1=a1, a2=a2, a3=a3, C1=C1, Mmax=Mmax)
+    else:
+        M1, M2, A = createSampleUniverse(binaryFraction=binaryFraction, x1=x1, x2=x2, x3=x3, x4=x4, \
+                                  a1=a1, a2=a2, a3=a3, C1=C1, Mmax=Mmax, Amin=Amin, Amax=Amax)
 
     totalMassInStarFormation = np.sum(M1) + np.sum(M2)
 
     #Now mask M1 and M2 to see what lies in the range of COMPAS
     maskM1 = (M1>=Mlower) & (M1<=Mupper)
     maskBinaries = (M2!=0)
-    mask = maskM1 & maskBinaries
+    if Amin is None and Amax is None:
+        mask = maskM1 & maskBinaries
+    else:
+        maskA = (A>=Amin) & (M1<=Amax)
+        mask = maskM1 & maskBinaries & maskA
 
     totalMassEvolvedCOMPAS = np.sum(M1[mask]) + np.sum(M2[mask])
 

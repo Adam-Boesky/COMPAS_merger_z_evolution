@@ -1,17 +1,25 @@
+from multiprocessing import Pool
 import numpy as np
 import h5py  as h5
 import os
+import sys
 import time
 import matplotlib.pyplot as plt
 from astropy.cosmology import WMAP9 as cosmology
 import scipy
 from scipy.interpolate import interp1d
 from scipy.stats import norm as NormDist
+from KDEpy import FFTKDE  # Fastest 1D algorithm
 import ClassCOMPAS
+import ClassMSSFR
 import selection_effects
 import warnings
 import astropy.units as u
 import argparse
+
+sys.path.append('/Users/adamboesky/Research/PRISE/exploring_parameter_space/Data_Analysis/Scripts')
+
+import formation_channels
 
 def calculate_redshift_related_params(max_redshift=10.0, max_redshift_detection=1.0, redshift_step=0.001, z_first_SF = 10.0):
     """ 
@@ -89,11 +97,11 @@ def find_metallicity_distribution(redshifts, min_logZ_COMPAS, max_logZ_COMPAS,
         min_logZ_COMPAS    --> [float]          Minimum logZ value that COMPAS samples
         max_logZ_COMPAS    --> [float]          Maximum logZ value that COMPAS samples
         
-        mu0    =  0.035    --> [float]           location (mean in normal) at redshift 0
-        muz    = -0.25    --> [float]           redshift scaling/evolution of the location
+        mu0    =  0.035    --> [float]          location (mean in normal) at redshift 0
+        muz    = -0.25     --> [float]          redshift scaling/evolution of the location
         sigma_0 = 0.39     --> [float]          Scale (variance in normal) at redshift 0
         sigma_z = 0.00     --> [float]          redshift scaling of the scale (variance in normal)
-        alpha   = 0.00    --> [float]          shape (skewness, alpha = 0 retrieves normal dist)
+        alpha   = 0.00     --> [float]          shape (skewness, alpha = 0 retrieves normal dist)
 
         min_logZ           --> [float]          Minimum logZ at which to calculate dPdlogZ (influences normalization)
         max_logZ           --> [float]          Maximum logZ at which to calculate dPdlogZ (influences normalization)
@@ -209,6 +217,7 @@ def find_formation_and_merger_rates(n_binaries, redshifts, times, time_first_SF,
             merger_rate[i, :first_too_early_index - 1] = formation_rate[i, z_of_formation_index]
     return formation_rate, merger_rate
 
+
 def compute_snr_and_detection_grids(sensitivity="O1", snr_threshold=8.0, Mc_max=300.0, Mc_step=0.1,
                                     eta_max=0.25, eta_step=0.01, snr_max=1000.0, snr_step=0.1):
     """
@@ -307,6 +316,92 @@ def find_detection_probability(Mc, eta, redshifts, distances, n_redshifts_detect
 
     return detection_probability
 
+
+# MADE BY ADAM
+def find_prescribed_metallicity_distribution(redshifts, min_logZ_COMPAS, max_logZ_COMPAS, min_logZ=-12.0, max_logZ=0.0,
+                                                Zprescription=None, SFRprescription=None, logNormalPrescription=None, GSMFprescription=None, ZMprescription=None):
+    """
+#     Calculate the distribution of metallicities at different redshifts using given perscriptions for the mssfr class. This function
+#     uses ClassMSSFR to conduct most of its important calculations.
+
+#     NOTE: This assumes that metallicities in COMPAS are drawn from a flat in log distribution!
+
+#     Args:
+#         redshifts          --> [float array]    an array of the redshifts for which we will do our calculations
+#         min_logZ_COMPAS    --> [float]          Minimum logZ value that COMPAS samples
+#         max_logZ_COMPAS    --> [float]          Maximum logZ value that COMPAS samples
+        
+#         Zprescription      --> [string]         if you use ZM_GSMF or LogNormal metallicity distribution
+#         SFRprescription    --> [string]         the prescription for the SFRD
+#         logNormalPrescription --> [string]      the prescription if the function will assume a lognormal distribution
+#         GSMFprescription   --> [string]         the GSMF prescription
+#         ZMprescription     --> [strinig]        the mass-metallicity relationship
+
+#         min_logZ           --> [float]          Minimum logZ at which to calculate dPdlogZ (influences normalization)
+#         max_logZ           --> [float]          Maximum logZ at which to calculate dPdlogZ (influences normalization)
+
+#     Returns:
+#         dPdlogZ            --> [2D float array] Probability of getting a particular logZ at a certain redshift
+#         metallicities      --> [list of floats] Metallicities at which dPdlogZ is evaluated
+#         p_draw_metallicity --> float            Probability of drawing a certain metallicity in COMPAS (float because assuming uniform)
+#         sfr                --> [float array]    The star formation rate
+#     """ 
+
+
+    # Get metallicity grid
+    log_metallicities = np.linspace(min_logZ, max_logZ, num=len(redshifts))
+    step_logZ = log_metallicities[1] - log_metallicities[0]
+    metallicities = np.power(10, log_metallicities)
+    
+    # Declare MSSFR object
+    mssfr = ClassMSSFR.MSSFR(metallicityGrid=metallicities)
+
+    # Provide given perscriptions to the MSSFR object
+    mssfr.Zprescription         = Zprescription
+    mssfr.SFRprescription       = SFRprescription
+    mssfr.logNormalPrescription = logNormalPrescription
+    mssfr.GSMFprescription      = GSMFprescription
+    mssfr.ZMprescription        = ZMprescription
+
+    # Get ages
+    ages = mssfr.cosmology.age(redshifts).value
+
+    # Get the SFR
+    sfr = mssfr.returnSFR(redshifts, ages)
+
+    # Declare array for the probability of getting a binary for each logZ
+    dPdlogZ = np.zeros((len(redshifts), len(metallicities)))
+
+    # Get the edges for the calculation of the probability at each metallicity
+    first_edge = (10**(log_metallicities[0] - step_logZ) + metallicities[0])/2
+    last_edge = (10**(log_metallicities[-1] + step_logZ) + metallicities[-1])/2
+    edges = np.concatenate((np.concatenate((np.array([first_edge]), (metallicities[1:] + metallicities[:-1])/2)), np.array([last_edge])))
+
+    # Get the width of each bin
+    width  = np.diff(np.log10(edges))
+
+    # Calculate the dpdZ for each redshift by iterating through each metallicity
+    for nrZ, Z in enumerate(metallicities):
+
+        # Get bounds
+        Zlower   = edges[nrZ]
+        Zupper   = edges[nrZ+1]
+
+        # Get probability for specific Z and fill column of dPdlogZ
+        dPdlogZ[:, nrZ] = mssfr.returnFractionMZ_GSMF(Zlower, Zupper, redshifts)
+    
+    # Divid by width to get from dpdZ --> dpdlogZ
+    dPdlogZ = np.divide(dPdlogZ, width)
+
+    # Normalize!!!!!!! NOT SURE IF THIS IS NECESSARY???
+    norm = dPdlogZ.sum(axis=-1) * step_logZ
+    dPdlogZ = dPdlogZ / norm[:,np.newaxis]
+
+    # assume a flat in log distribution in sampled metallicity to find probability of drawing Z in COMPAS
+    p_draw_metallicity = 1 / (max_logZ_COMPAS - min_logZ_COMPAS)
+
+    return dPdlogZ, metallicities, p_draw_metallicity, sfr
+
 def find_detection_rate(path, dco_type="BBH", merger_output_filename=None, weight_column=None,
                         merges_hubble_time=True, pessimistic_CEE=True, no_RLOF_after_CEE=True,
                         max_redshift=10.0, max_redshift_detection=1.0, redshift_step=0.001, z_first_SF = 10,
@@ -316,7 +411,10 @@ def find_detection_rate(path, dco_type="BBH", merger_output_filename=None, weigh
                         min_logZ=-12.0, max_logZ=0.0, step_logZ=0.01,
                         sensitivity="O1", snr_threshold=8, 
                         Mc_max=300.0, Mc_step=0.1, eta_max=0.25, eta_step=0.01,
-                        snr_max=1000.0, snr_step=0.1):
+                        snr_max=1000.0, snr_step=0.1,
+                        lognormal=False, Zprescription='MZ_GSMF', SFRprescription='Madau et al. (2017)',                    # ADDED BY ADAM
+                        GSMFprescription='Panter et al. (2004) Single', ZMprescription='Langer et al. +offset (2006)',      # ADDED BY ADAM
+                        logNormalPrescription=None):                                                                        # ADDED BY ADAM
     """
         The main function of this file. Finds the detection rate, formation rate and merger rate for each
         binary in a COMPAS file at a series of redshifts defined by intput. Also returns relevant COMPAS
@@ -377,6 +475,16 @@ def find_detection_rate(path, dco_type="BBH", merger_output_filename=None, weigh
             snr_max                --> [float]  Maximum snr in grid
             snr_step               --> [float]  Step in snr to use in grid
 
+            =====================================================
+            == Arguments for non-lognormal MSSFR prescriptions ==
+            =====================================================
+            NOTE: These were all added by Adam
+            lognormal              --> [bool]   Whether the MSSFR is lognormal
+            SFRprescription        --> [string] The SFRD prescription
+            GSMFprescription       --> [string] The GSMF prescription
+            ZMprescription         --> [string] The M-Z relation prescription
+
+
         Returns:
             detection_rate         --> [2D float array] Detection rate for each binary at each redshift in 1/yr
             formation_rate         --> [2D float array] Formation rate for each binary at each redshift in 1/yr/Gpc^3
@@ -436,26 +544,35 @@ def find_detection_rate(path, dco_type="BBH", merger_output_filename=None, weigh
 
     # calculate the redshifts array and its equivalents
     redshifts, n_redshifts_detection, times, time_first_SF, distances, shell_volumes = calculate_redshift_related_params(max_redshift, max_redshift_detection, redshift_step, z_first_SF)
+    
+    # Check if the MSSFR prescription is lognormal or not
+    if lognormal:
 
-    # find the star forming mass per year per Gpc^3 and convert to total number formed per year per Gpc^3
-    sfr = find_sfr(redshifts, a = aSF, b = bSF, c = cSF, d = dSF) # functional form from Madau & Dickinson 2014
+        # work out the metallicity distribution at each redshift and probability of drawing each metallicity in COMPAS
+        if np.log(np.min(COMPAS.initialZ)) != np.log(np.max(COMPAS.initialZ)): # Will perform integral over metallicities
+            dPdlogZ, metallicities, p_draw_metallicity = find_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)),
+                                                                                    max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)),
+                                                                                    mu0=mu0, muz=muz, sigma_0=sigma0, sigma_z=sigmaz, alpha = alpha,
+                                                                                    min_logZ=min_logZ, max_logZ=max_logZ, step_logZ = step_logZ)
+        else:
+            metallicities = None
+            dPdlogZ = 1
+            p_draw_metallicity = 1
+    
+        # find the star forming mass per year per Gpc^3 and convert to total number formed per year per Gpc^3
+        sfr = find_sfr(redshifts, a = aSF, b = bSF, c = cSF, d = dSF) # functional form from Madau & Dickinson 2014
+
+    else:
+        # work out the metallicity distribution at each redshift, probability of drawing each metallicity in COMPAS, and find the total number formed per year per Gpc^3
+        dPdlogZ, metallicities, p_draw_metallicity, sfr = find_prescribed_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)), 
+                                                max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)), min_logZ=min_logZ, max_logZ=max_logZ,
+                                                Zprescription=Zprescription, SFRprescription=SFRprescription, logNormalPrescription=logNormalPrescription, 
+                                                GSMFprescription=GSMFprescription, ZMprescription=ZMprescription)
 
     # Calculate the representative SF mass
     Average_SF_mass_needed = (COMPAS.mass_evolved_per_binary * COMPAS.n_systems)
     print('Average_SF_mass_needed = ', Average_SF_mass_needed) # print this, because it might come in handy to know when writing up results :)
-    n_formed = sfr / Average_SF_mass_needed # Divide the star formation rate density by the representative SF mass
-
-
-    # work out the metallicity distribution at each redshift and probability of drawing each metallicity in COMPAS
-    if np.log(np.min(COMPAS.initialZ)) != np.log(np.max(COMPAS.initialZ)): # Will perform integral over metallicities
-        dPdlogZ, metallicities, p_draw_metallicity = find_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)),
-                                                                                max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)),
-                                                                                mu0=mu0, muz=muz, sigma_0=sigma0, sigma_z=sigmaz, alpha = alpha,
-                                                                                min_logZ=min_logZ, max_logZ=max_logZ, step_logZ = step_logZ)
-    else:
-        metallicities = None
-        dPdlogZ = 1
-        p_draw_metallicity = 1
+    n_formed = sfr / Average_SF_mass_needed # Divide the star formation rate density by the representative SF mass    
 
 
     # calculate the formation and merger rates using what we computed above
@@ -836,4 +953,1180 @@ if __name__ == "__main__":
     print('CI took ', end_CI - start_CI, 's')
     print('Appending rates took ', end_append - start_append, 's')
     print('plot took ', end_plot - start_plot, 's')
+
+def find_detection_rate_by_channel(path, channel_type, dco_type="BBH", merger_output_filename=None, weight_column=None,
+                        merges_hubble_time=True, pessimistic_CEE=True, no_RLOF_after_CEE=True,
+                        max_redshift=10.0, max_redshift_detection=1.0, redshift_step=0.001, z_first_SF = 10,
+                        use_sampled_mass_ranges=True, m1_min=5 * u.Msun, m1_max=150 * u.Msun, m2_min=0.1 * u.Msun, fbin=0.7,
+                        aSF = 0.01, bSF = 2.77, cSF = 2.90, dSF = 4.70,
+                        mu0=0.035, muz=-0.23, sigma0=0.39,sigmaz=0., alpha=0.0, 
+                        min_logZ=-12.0, max_logZ=0.0, step_logZ=0.01,
+                        sensitivity="O1", snr_threshold=8, 
+                        Mc_max=300.0, Mc_step=0.1, eta_max=0.25, eta_step=0.01,
+                        snr_max=1000.0, snr_step=0.1,
+                        lognormal=False, Zprescription='MZ_GSMF', SFRprescription='Madau et al. (2017)',                    # ADDED BY ADAM
+                        GSMFprescription='Panter et al. (2004) Single', ZMprescription='Langer et al. +offset (2006)',      # ADDED BY ADAM
+                        logNormalPrescription=None):                                                                        # ADDED BY ADAM
+    """
+        The main function of this file. Finds the detection rate, formation rate and merger rate for each
+        binary in a COMPAS file at a series of redshifts defined by intput. Also returns relevant COMPAS
+        data.
+
+        NOTE: This code assumes that assumes that metallicities in COMPAS are drawn from a flat in log distribution
+
+        Args:
+            ===================================================
+            == Arguments for finding and masking COMPAS file ==
+            ===================================================
+            path                   --> [string] Path to the COMPAS data file that contains the output
+            channel_type           --> [int]    the number channel that we will calculate the rates for
+            dco_type               --> [string] Which DCO type to calculate rates for: one of ["all", "BBH", "BHNS", "BNS"]
+            merger_output_filename --> [string] Optional name of output file to store merging DCOs (do not create the extra output if None)
+            weight_column          --> [string] Name of column in "DoubleCompactObjects" file that contains adaptive sampling weights
+                                                    (Leave this as None if you have unweighted samples)
+            merges_in_hubble_time  --> [bool]   whether to mask binaries that don't merge in a Hubble time
+            no_RLOF_after_CEE      --> [bool]   whether to mask binaries that have immediate RLOF after a CCE
+            pessimistic_CEE        --> [bool]   whether to mask binaries that go through Optimistic CE scenario
+
+            ===========================================
+            == Arguments for creating redshift array ==
+            ===========================================
+            max_redshift           --> [float]  Maximum redshift to use in array
+            max_redshift_detection --> [float]  Maximum redshift to calculate detection rates (must be <= max_redshift)
+            redshift_step          --> [float]  Size of step to take in redshift
+
+            ====================================================================
+            == Arguments for determining star forming mass per sampled binary ==
+            ====================================================================
+            use_sampled_mass_ranges--> [bool]   whether to use the min and max m1 and m2 samples in lieu of hard cutoffs as below
+            m1_min                 --> [float]  Minimum primary mass sampled by COMPAS
+            m1_max                 --> [float]  Maximum primary mass sampled by COMPAS
+            m2_min                 --> [float]  Minimum secondary mass sampled by COMPAS
+            fbin                   --> [float]  Binary fraction used by COMPAS
+
+            =======================================================================
+            == Arguments for creating metallicity distribution and probabilities ==
+            =======================================================================
+            mu0                    --> [float]  metallicity dist: expected value at redshift 0
+            muz                    --> [float]  metallicity dist: redshift evolution of expected value
+            sigma0                 --> [float]  metallicity dist: width at redshhift 0
+            sigmaz                 --> [float]  metallicity dist: redshift evolution of width
+            alpha                  --> [float]  metallicity dist: skewness (0 = lognormal)
+            min_logZ               --> [float]  Minimum logZ at which to calculate dPdlogZ
+            max_logZ               --> [float]  Maximum logZ at which to calculate dPdlogZ
+            step_logZ              --> [float]  Size of logZ steps to take in finding a Z range
+
+            =======================================================
+            == Arguments for determining detection probabilities ==
+            =======================================================
+            sensitivity            --> [string] Which detector sensitivity to use: one of ["design", "O1", "O3"]
+            snr_threshold          --> [float]  What SNR threshold required for a detection
+            Mc_max                 --> [float]  Maximum chirp mass in grid
+            Mc_step                --> [float]  Step in chirp mass to use in grid
+            eta_max                --> [float]  Maximum symmetric mass ratio in grid
+            eta_step               --> [float]  Step in symmetric mass ratio to use in grid
+            snr_max                --> [float]  Maximum snr in grid
+            snr_step               --> [float]  Step in snr to use in grid
+
+            =====================================================
+            == Arguments for non-lognormal MSSFR prescriptions ==
+            =====================================================
+            NOTE: These were all added by Adam
+            lognormal              --> [bool]   Whether the MSSFR is lognormal
+            SFRprescription        --> [string] The SFRD prescription
+            GSMFprescription       --> [string] The GSMF prescription
+            ZMprescription         --> [string] The M-Z relation prescription
+
+
+
+        Returns:
+            detection_rate         --> [2D float array] Detection rate for each binary at each redshift in 1/yr
+            formation_rate         --> [2D float array] Formation rate for each binary at each redshift in 1/yr/Gpc^3
+            merger_rate            --> [2D float array] Merger rate for each binary at each redshift in 1/yr/Gpc^3
+            redshifts              --> [list of floats] List of redshifts
+            COMPAS                 --> [Object]         Relevant COMPAS data in COMPASData Class
+    """
+
+    # assert that input will not produce errors
+    assert max_redshift_detection <= max_redshift, "Maximum detection redshift cannot be below maximum redshift"
+    assert m1_min <= m1_max, "Minimum sampled primary mass cannot be above maximum sampled primary mass"
+    assert np.logical_and(fbin >= 0.0, fbin <= 1.0), "Binary fraction must be between 0 and 1"
+    assert Mc_step < Mc_max, "Chirp mass step size must be less than maximum chirp mass"
+    assert eta_step < eta_max, "Symmetric mass ratio step size must be less than maximum symmetric mass ratio"
+    assert snr_step < snr_max, "SNR step size must be less than maximum SNR"
+
+    nonnegative_args = [(max_redshift, "max_redshift"), (max_redshift_detection, "max_redshift_detection"), (m1_min.value, "m1_min"), (m1_max.value, "m1_max"),
+                        (m2_min.value, "m2_min"), (mu0, "mu0"), (sigma0, "sigma0"),  
+                        (step_logZ, "step_logZ"), (snr_threshold, "snr_threshold"), (Mc_max, "Mc_max"),
+                        (Mc_step, "Mc_step"), (eta_max, "eta_max"), (eta_step, "eta_step"), (snr_max, "snr_max"), (snr_step, "snr_step")]
+
+
+    for arg, arg_str in nonnegative_args:
+        assert arg >= 0.0, "{} must be nonnegative".format(arg_str)
+
+    # warn if input is not advisable
+    if redshift_step > max_redshift_detection:
+        warnings.warn("Redshift step is greater than maximum detection redshift", stacklevel=2)
+    if Mc_step > 1.0:
+        warnings.warn("Chirp mass step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+    if eta_step > 0.1:
+        warnings.warn("Symmetric mass ratio step is greater than 0.1, large step sizes can produce unpredictable results", stacklevel=2)
+    if snr_step > 1.0:
+        warnings.warn("SNR step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+
+    # start by getting the necessary data from the COMPAS file
+    COMPAS = ClassCOMPAS.COMPASData(path, Mlower=m1_min, Mupper=m1_max, m2_min=m2_min, binaryFraction=fbin, suppress_reminder=True)
+    COMPAS.setCOMPASDCOmask(types=dco_type, withinHubbleTime=merges_hubble_time, pessimistic=pessimistic_CEE, noRLOFafterCEE=no_RLOF_after_CEE)
+    COMPAS.setCOMPASData()
+    
+    # Mak masks to filer for the channel only
+    channel = formation_channels.identify_formation_channels(COMPAS.seedsDCO, h5.File(path))
+    channel_mask = channel==channel_type
+
+    COMPAS.set_sw_weights(weight_column)
+    m1=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(1)")
+    m2=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(2)")
+    if use_sampled_mass_ranges:
+        COMPAS.Mlower=min(m1[m1!=m2])*u.Msun    # the m1!=m2 ensures we don't include masses set equal through RLOF at ZAMS
+        COMPAS.Mupper=max(m1)*u.Msun
+        COMPAS.m2_min=min(m2)*u.Msun
+    COMPAS.find_star_forming_mass_per_binary_sampling()
+
+    # compute the chirp masses and symmetric mass ratios only for systems of interest
+    chirp_masses = (COMPAS.mass1[channel_mask]*COMPAS.mass2[channel_mask])**(3/5) / (COMPAS.mass1[channel_mask] + COMPAS.mass2[channel_mask])**(1/5)
+    n_binaries = len(chirp_masses)
+    # another warning on poor input
+    if max(chirp_masses)*(1+max_redshift_detection) > Mc_max:
+        warnings.warn("Maximum chirp mass used for detectability calculation is below maximum binary chirp mass * (1+maximum redshift for detectability calculation)", stacklevel=2)
+
+    # calculate the redshifts array and its equivalents
+    redshifts, n_redshifts_detection, times, time_first_SF, distances, shell_volumes = calculate_redshift_related_params(max_redshift, max_redshift_detection, redshift_step, z_first_SF)
+    
+    # Check if the MSSFR prescription is lognormal or not
+    if lognormal:
+
+        # work out the metallicity distribution at each redshift and probability of drawing each metallicity in COMPAS
+        if np.log(np.min(COMPAS.initialZ)) != np.log(np.max(COMPAS.initialZ)): # Will perform integral over metallicities
+            dPdlogZ, metallicities, p_draw_metallicity = find_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)),
+                                                                                    max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)),
+                                                                                    mu0=mu0, muz=muz, sigma_0=sigma0, sigma_z=sigmaz, alpha = alpha,
+                                                                                    min_logZ=min_logZ, max_logZ=max_logZ, step_logZ = step_logZ)
+        else:
+            metallicities = None
+            dPdlogZ = 1
+            p_draw_metallicity = 1
+    
+        # find the star forming mass per year per Gpc^3 and convert to total number formed per year per Gpc^3
+        sfr = find_sfr(redshifts, a = aSF, b = bSF, c = cSF, d = dSF) # functional form from Madau & Dickinson 2014
+
+    else:
+        # work out the metallicity distribution at each redshift, probability of drawing each metallicity in COMPAS, and find the total number formed per year per Gpc^3
+        dPdlogZ, metallicities, p_draw_metallicity, sfr = find_prescribed_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)), 
+                                                max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)), min_logZ=min_logZ, max_logZ=max_logZ,
+                                                Zprescription=Zprescription, SFRprescription=SFRprescription, logNormalPrescription=logNormalPrescription, 
+                                                GSMFprescription=GSMFprescription, ZMprescription=ZMprescription)
+
+    # Calculate the representative SF mass
+    Average_SF_mass_needed = (COMPAS.mass_evolved_per_binary * COMPAS.n_systems)
+    print('Average_SF_mass_needed = ', Average_SF_mass_needed) # print this, because it might come in handy to know when writing up results :)
+    n_formed = sfr / Average_SF_mass_needed # Divide the star formation rate density by the representative SF mass    
+
+
+    # calculate the formation and merger rates using what we computed above
+    formation_rate, merger_rate = find_formation_and_merger_rates(n_binaries, redshifts, times, time_first_SF, n_formed, dPdlogZ,
+                                                                    metallicities, p_draw_metallicity, COMPAS.metallicitySystems[channel_mask],
+                                                                    COMPAS.delayTimes[channel_mask], COMPAS.sw_weights) # If we are using sw_weights, we must add: [sps_channel_mask])
+
+    # create lookup tables for the SNR at 1Mpc as a function of the masses and the probability of detection as a function of SNR
+    snr_grid_at_1Mpc, detection_probability_from_snr = compute_snr_and_detection_grids(sensitivity, snr_threshold, Mc_max, Mc_step,
+                                                                                    eta_max, eta_step, snr_max, snr_step)
+
+    etas = COMPAS.mass1[channel_mask] * COMPAS.mass2[channel_mask] / (COMPAS.mass1[channel_mask] + COMPAS.mass2[channel_mask])**2
+    # use lookup tables to find the probability of detecting each binary at each redshift
+    detection_probability = find_detection_probability(chirp_masses, etas, redshifts, distances, n_redshifts_detection, n_binaries,
+                                                        snr_grid_at_1Mpc, detection_probability_from_snr, Mc_step, eta_step, snr_step)
+
+
+    # finally, compute the detection rate using Neijssel+19 Eq. 2
+    detection_rate = np.zeros(shape=(n_binaries, n_redshifts_detection))
+    detection_rate = merger_rate[:, :n_redshifts_detection] * detection_probability \
+                    * shell_volumes[:n_redshifts_detection] / (1 + redshifts[:n_redshifts_detection])
+
+    
+    if(merger_output_filename!=None): # Store merger rates in an output text file if specified
+        with open(path+merger_output_filename, 'w') as output:
+            output.write('Mass1atMerger \t Mass2atMerger \t MergerRedshift \t MergerRate \n')
+            output.write('Msun \t Msun \t -- \t Gpc^{-3} yr^{-1} \n')
+            for i in range(n_redshifts_detection):
+                for j in range(n_binaries):
+                    if(merger_rate[j][i]>0):
+                        output.write(f'{COMPAS.mass1[j]:.5f}\t{COMPAS.mass2[j]:.5f}\t{redshifts[i]:.5f}\t{merger_rate[j][i]:.10f}\n')
+    
+    return detection_rate, formation_rate, merger_rate, redshifts, COMPAS
+
+
+
+def find_detection_rate_by_delay_time(path, bin_edges, dco_type="BBH", merger_output_filename=None, weight_column=None,
+                        merges_hubble_time=True, pessimistic_CEE=True, no_RLOF_after_CEE=True,
+                        max_redshift=10.0, max_redshift_detection=1.0, redshift_step=0.001, z_first_SF = 10,
+                        use_sampled_mass_ranges=True, m1_min=5 * u.Msun, m1_max=150 * u.Msun, m2_min=0.1 * u.Msun, fbin=0.7,
+                        aSF = 0.01, bSF = 2.77, cSF = 2.90, dSF = 4.70,
+                        mu0=0.035, muz=-0.23, sigma0=0.39,sigmaz=0., alpha=0.0, 
+                        min_logZ=-12.0, max_logZ=0.0, step_logZ=0.01,
+                        sensitivity="O1", snr_threshold=8, 
+                        Mc_max=300.0, Mc_step=0.1, eta_max=0.25, eta_step=0.01,
+                        snr_max=1000.0, snr_step=0.1,
+                        lognormal=False, Zprescription='MZ_GSMF', SFRprescription='Madau et al. (2017)',                    # ADDED BY ADAM
+                        GSMFprescription='Panter et al. (2004) Single', ZMprescription='Langer et al. +offset (2006)',      # ADDED BY ADAM
+                        logNormalPrescription=None):                                                                        # ADDED BY ADAM
+    """
+        The main function of this file. Finds the detection rate, formation rate and merger rate for each
+        binary in a COMPAS file at a series of redshifts defined by intput. Also returns relevant COMPAS
+        data.
+
+        NOTE: This code assumes that assumes that metallicities in COMPAS are drawn from a flat in log distribution
+
+        Args:
+            ===================================================
+            == Arguments for finding and masking COMPAS file ==
+            ===================================================
+            path                   --> [string] Path to the COMPAS data file that contains the output
+            channel_type           --> [int]    the number channel that we will calculate the rates for
+            dco_type               --> [string] Which DCO type to calculate rates for: one of ["all", "BBH", "BHNS", "BNS"]
+            merger_output_filename --> [string] Optional name of output file to store merging DCOs (do not create the extra output if None)
+            weight_column          --> [string] Name of column in "DoubleCompactObjects" file that contains adaptive sampling weights
+                                                    (Leave this as None if you have unweighted samples)
+            merges_in_hubble_time  --> [bool]   whether to mask binaries that don't merge in a Hubble time
+            no_RLOF_after_CEE      --> [bool]   whether to mask binaries that have immediate RLOF after a CCE
+            pessimistic_CEE        --> [bool]   whether to mask binaries that go through Optimistic CE scenario
+
+            ===========================================
+            == Arguments for creating redshift array ==
+            ===========================================
+            max_redshift           --> [float]  Maximum redshift to use in array
+            max_redshift_detection --> [float]  Maximum redshift to calculate detection rates (must be <= max_redshift)
+            redshift_step          --> [float]  Size of step to take in redshift
+
+            ====================================================================
+            == Arguments for determining star forming mass per sampled binary ==
+            ====================================================================
+            use_sampled_mass_ranges--> [bool]   whether to use the min and max m1 and m2 samples in lieu of hard cutoffs as below
+            m1_min                 --> [float]  Minimum primary mass sampled by COMPAS
+            m1_max                 --> [float]  Maximum primary mass sampled by COMPAS
+            m2_min                 --> [float]  Minimum secondary mass sampled by COMPAS
+            fbin                   --> [float]  Binary fraction used by COMPAS
+
+            =======================================================================
+            == Arguments for creating metallicity distribution and probabilities ==
+            =======================================================================
+            mu0                    --> [float]  metallicity dist: expected value at redshift 0
+            muz                    --> [float]  metallicity dist: redshift evolution of expected value
+            sigma0                 --> [float]  metallicity dist: width at redshhift 0
+            sigmaz                 --> [float]  metallicity dist: redshift evolution of width
+            alpha                  --> [float]  metallicity dist: skewness (0 = lognormal)
+            min_logZ               --> [float]  Minimum logZ at which to calculate dPdlogZ
+            max_logZ               --> [float]  Maximum logZ at which to calculate dPdlogZ
+            step_logZ              --> [float]  Size of logZ steps to take in finding a Z range
+
+            =======================================================
+            == Arguments for determining detection probabilities ==
+            =======================================================
+            sensitivity            --> [string] Which detector sensitivity to use: one of ["design", "O1", "O3"]
+            snr_threshold          --> [float]  What SNR threshold required for a detection
+            Mc_max                 --> [float]  Maximum chirp mass in grid
+            Mc_step                --> [float]  Step in chirp mass to use in grid
+            eta_max                --> [float]  Maximum symmetric mass ratio in grid
+            eta_step               --> [float]  Step in symmetric mass ratio to use in grid
+            snr_max                --> [float]  Maximum snr in grid
+            snr_step               --> [float]  Step in snr to use in grid
+
+            =====================================================
+            == Arguments for non-lognormal MSSFR prescriptions ==
+            =====================================================
+            NOTE: These were all added by Adam
+            lognormal              --> [bool]   Whether the MSSFR is lognormal
+            SFRprescription        --> [string] The SFRD prescription
+            GSMFprescription       --> [string] The GSMF prescription
+            ZMprescription         --> [string] The M-Z relation prescription
+
+
+        Returns:
+            detection_rate         --> [2D float array] Detection rate for each binary at each redshift in 1/yr
+            formation_rate         --> [2D float array] Formation rate for each binary at each redshift in 1/yr/Gpc^3
+            merger_rate            --> [2D float array] Merger rate for each binary at each redshift in 1/yr/Gpc^3
+            redshifts              --> [list of floats] List of redshifts
+            COMPAS                 --> [Object]         Relevant COMPAS data in COMPASData Class
+    """
+
+    # assert that input will not produce errors
+    assert max_redshift_detection <= max_redshift, "Maximum detection redshift cannot be below maximum redshift"
+    assert m1_min <= m1_max, "Minimum sampled primary mass cannot be above maximum sampled primary mass"
+    assert np.logical_and(fbin >= 0.0, fbin <= 1.0), "Binary fraction must be between 0 and 1"
+    assert Mc_step < Mc_max, "Chirp mass step size must be less than maximum chirp mass"
+    assert eta_step < eta_max, "Symmetric mass ratio step size must be less than maximum symmetric mass ratio"
+    assert snr_step < snr_max, "SNR step size must be less than maximum SNR"
+
+    nonnegative_args = [(max_redshift, "max_redshift"), (max_redshift_detection, "max_redshift_detection"), (m1_min.value, "m1_min"), (m1_max.value, "m1_max"),
+                        (m2_min.value, "m2_min"), (mu0, "mu0"), (sigma0, "sigma0"),  
+                        (step_logZ, "step_logZ"), (snr_threshold, "snr_threshold"), (Mc_max, "Mc_max"),
+                        (Mc_step, "Mc_step"), (eta_max, "eta_max"), (eta_step, "eta_step"), (snr_max, "snr_max"), (snr_step, "snr_step")]
+
+
+    for arg, arg_str in nonnegative_args:
+        assert arg >= 0.0, "{} must be nonnegative".format(arg_str)
+
+    # warn if input is not advisable
+    if redshift_step > max_redshift_detection:
+        warnings.warn("Redshift step is greater than maximum detection redshift", stacklevel=2)
+    if Mc_step > 1.0:
+        warnings.warn("Chirp mass step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+    if eta_step > 0.1:
+        warnings.warn("Symmetric mass ratio step is greater than 0.1, large step sizes can produce unpredictable results", stacklevel=2)
+    if snr_step > 1.0:
+        warnings.warn("SNR step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+
+    # start by getting the necessary data from the COMPAS file
+    COMPAS = ClassCOMPAS.COMPASData(path, Mlower=m1_min, Mupper=m1_max, m2_min=m2_min, binaryFraction=fbin, suppress_reminder=True)
+    COMPAS.setCOMPASDCOmask(types=dco_type, withinHubbleTime=merges_hubble_time, pessimistic=pessimistic_CEE, noRLOFafterCEE=no_RLOF_after_CEE)
+    COMPAS.setCOMPASData()
+    COMPAS.set_sw_weights(weight_column)
+    
+    # Mak masks to filer for the channel only
+    time, coalescence_time =COMPAS.get_COMPAS_variables("BSE_Double_Compact_Objects",["Time", "Coalescence_Time"])
+    t_delay = time[COMPAS.DCOmask] + coalescence_time[COMPAS.DCOmask]
+
+    # A mask for all the 
+    bin_mask = np.logical_and(t_delay>=bin_edges[0], t_delay < bin_edges[1])
+    if np.all(bin_mask == False):
+        print('There are no binaries with delay times in the bin ', bin_edges)
+        return None, None, None, None, None
+    else:
+        m1=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(1)")
+        m2=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(2)")
+        if use_sampled_mass_ranges:
+            COMPAS.Mlower=min(m1[m1!=m2])*u.Msun    # the m1!=m2 ensures we don't include masses set equal through RLOF at ZAMS
+            COMPAS.Mupper=max(m1)*u.Msun
+            COMPAS.m2_min=min(m2)*u.Msun
+        COMPAS.find_star_forming_mass_per_binary_sampling()
+
+        # compute the chirp masses and symmetric mass ratios only for systems of interest
+        chirp_masses = (COMPAS.mass1[bin_mask]*COMPAS.mass2[bin_mask])**(3/5) / (COMPAS.mass1[bin_mask] + COMPAS.mass2[bin_mask])**(1/5)
+        n_binaries = len(chirp_masses)
+        # another warning on poor input
+        if max(chirp_masses)*(1+max_redshift_detection) > Mc_max:
+            warnings.warn("Maximum chirp mass used for detectability calculation is below maximum binary chirp mass * (1+maximum redshift for detectability calculation)", stacklevel=2)
+
+        # calculate the redshifts array and its equivalents
+        redshifts, n_redshifts_detection, times, time_first_SF, distances, shell_volumes = calculate_redshift_related_params(max_redshift, max_redshift_detection, redshift_step, z_first_SF)
+        
+        # Check if the MSSFR prescription is lognormal or not
+        if lognormal:
+
+            # work out the metallicity distribution at each redshift and probability of drawing each metallicity in COMPAS
+            if np.log(np.min(COMPAS.initialZ)) != np.log(np.max(COMPAS.initialZ)): # Will perform integral over metallicities
+                dPdlogZ, metallicities, p_draw_metallicity = find_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)),
+                                                                                        max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)),
+                                                                                        mu0=mu0, muz=muz, sigma_0=sigma0, sigma_z=sigmaz, alpha = alpha,
+                                                                                        min_logZ=min_logZ, max_logZ=max_logZ, step_logZ = step_logZ)
+            else:
+                metallicities = None
+                dPdlogZ = 1
+                p_draw_metallicity = 1
+        
+            # find the star forming mass per year per Gpc^3 and convert to total number formed per year per Gpc^3
+            sfr = find_sfr(redshifts, a = aSF, b = bSF, c = cSF, d = dSF) # functional form from Madau & Dickinson 2014
+
+        else:
+            # work out the metallicity distribution at each redshift, probability of drawing each metallicity in COMPAS, and find the total number formed per year per Gpc^3
+            dPdlogZ, metallicities, p_draw_metallicity, sfr = find_prescribed_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)), 
+                                                    max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)), min_logZ=min_logZ, max_logZ=max_logZ,
+                                                    Zprescription=Zprescription, SFRprescription=SFRprescription, logNormalPrescription=logNormalPrescription, 
+                                                    GSMFprescription=GSMFprescription, ZMprescription=ZMprescription)
+
+        # Calculate the representative SF mass
+        Average_SF_mass_needed = (COMPAS.mass_evolved_per_binary * COMPAS.n_systems)
+        print('Average_SF_mass_needed = ', Average_SF_mass_needed) # print this, because it might come in handy to know when writing up results :)
+        n_formed = sfr / Average_SF_mass_needed # Divide the star formation rate density by the representative SF mass    
+
+
+        # calculate the formation and merger rates using what we computed above
+        formation_rate, merger_rate = find_formation_and_merger_rates(n_binaries, redshifts, times, time_first_SF, n_formed, dPdlogZ,
+                                                                        metallicities, p_draw_metallicity, COMPAS.metallicitySystems[bin_mask],
+                                                                        COMPAS.delayTimes[bin_mask], COMPAS.sw_weights) # If we are using sw_weights, we must add: [sps_channel_mask])
+
+        # create lookup tables for the SNR at 1Mpc as a function of the masses and the probability of detection as a function of SNR
+        snr_grid_at_1Mpc, detection_probability_from_snr = compute_snr_and_detection_grids(sensitivity, snr_threshold, Mc_max, Mc_step,
+                                                                                        eta_max, eta_step, snr_max, snr_step)
+
+        etas = COMPAS.mass1[bin_mask] * COMPAS.mass2[bin_mask] / (COMPAS.mass1[bin_mask] + COMPAS.mass2[bin_mask])**2
+        # use lookup tables to find the probability of detecting each binary at each redshift
+        detection_probability = find_detection_probability(chirp_masses, etas, redshifts, distances, n_redshifts_detection, n_binaries,
+                                                            snr_grid_at_1Mpc, detection_probability_from_snr, Mc_step, eta_step, snr_step)
+
+
+        # finally, compute the detection rate using Neijssel+19 Eq. 2
+        detection_rate = np.zeros(shape=(n_binaries, n_redshifts_detection))
+        detection_rate = merger_rate[:, :n_redshifts_detection] * detection_probability \
+                        * shell_volumes[:n_redshifts_detection] / (1 + redshifts[:n_redshifts_detection])
+
+        
+        if(merger_output_filename!=None): # Store merger rates in an output text file if specified
+            with open(path+merger_output_filename, 'w') as output:
+                output.write('Mass1atMerger \t Mass2atMerger \t MergerRedshift \t MergerRate \n')
+                output.write('Msun \t Msun \t -- \t Gpc^{-3} yr^{-1} \n')
+                for i in range(n_redshifts_detection):
+                    for j in range(n_binaries):
+                        if(merger_rate[j][i]>0):
+                            output.write(f'{COMPAS.mass1[j]:.5f}\t{COMPAS.mass2[j]:.5f}\t{redshifts[i]:.5f}\t{merger_rate[j][i]:.10f}\n')
+        
+        return detection_rate, formation_rate, merger_rate, redshifts, COMPAS
+
+
+def find_sampled_detection_rates(path, mask, Mc_bins, dco_type="BBH", merger_output_filename=None, weight_column=None,
+                        merges_hubble_time=True, pessimistic_CEE=True, no_RLOF_after_CEE=True,
+                        max_redshift=10.0, max_redshift_detection=1.0, redshift_step=0.001, z_first_SF = 10,
+                        use_sampled_mass_ranges=True, m1_min=5 * u.Msun, m1_max=150 * u.Msun, m2_min=0.1 * u.Msun, fbin=0.7,
+                        aSF = 0.01, bSF = 2.77, cSF = 2.90, dSF = 4.70,
+                        mu0=0.035, muz=-0.23, sigma0=0.39,sigmaz=0., alpha=0.0, 
+                        min_logZ=-12.0, max_logZ=0.0, step_logZ=0.01,
+                        sensitivity="O1", snr_threshold=8, 
+                        Mc_max=300.0, Mc_step=0.1, eta_max=0.25, eta_step=0.01,
+                        snr_max=1000.0, snr_step=0.1,
+                        lognormal=False, Zprescription='MZ_GSMF', SFRprescription='Madau et al. (2017)',                    # ADDED BY ADAM
+                        GSMFprescription='Panter et al. (2004) Single', ZMprescription='Langer et al. +offset (2006)',      # ADDED BY ADAM
+                        logNormalPrescription=None):                                                                        # ADDED BY ADAM
+    """
+        The main function of this file. Finds the detection rate, formation rate and merger rate for each
+        binary in a COMPAS file at a series of redshifts defined by intput. Also returns relevant COMPAS
+        data.
+
+        NOTE: This code assumes that assumes that metallicities in COMPAS are drawn from a flat in log distribution
+
+        Args:
+            ===================================================
+            == Arguments for finding and masking COMPAS file ==
+            ===================================================
+            path                   --> [string]         Path to the COMPAS data file that contains the output
+            mask                   --> [1D int array]   A mask used to sample the data: each value corresponds to the index that we will sample
+            Mc_bins                --> [1D float array] An array that we will use to calculate the axis over which we will calculate the KDE
+            dco_type               --> [string]         Which DCO type to calculate rates for: one of ["all", "BBH", "BHNS", "BNS"]
+            merger_output_filename --> [string]         Optional name of output file to store merging DCOs (do not create the extra output if None)
+            weight_column          --> [string]         Name of column in "DoubleCompactObjects" file that contains adaptive sampling weights
+                                                            (Leave this as None if you have unweighted samples)
+            merges_in_hubble_time  --> [bool]           whether to mask binaries that don't merge in a Hubble time
+            no_RLOF_after_CEE      --> [bool]           whether to mask binaries that have immediate RLOF after a CCE
+            pessimistic_CEE        --> [bool]           whether to mask binaries that go through Optimistic CE scenario
+
+            ===========================================
+            == Arguments for creating redshift array ==
+            ===========================================
+            max_redshift           --> [float]  Maximum redshift to use in array
+            max_redshift_detection --> [float]  Maximum redshift to calculate detection rates (must be <= max_redshift)
+            redshift_step          --> [float]  Size of step to take in redshift
+
+            ====================================================================
+            == Arguments for determining star forming mass per sampled binary ==
+            ====================================================================
+            use_sampled_mass_ranges--> [bool]   whether to use the min and max m1 and m2 samples in lieu of hard cutoffs as below
+            m1_min                 --> [float]  Minimum primary mass sampled by COMPAS
+            m1_max                 --> [float]  Maximum primary mass sampled by COMPAS
+            m2_min                 --> [float]  Minimum secondary mass sampled by COMPAS
+            fbin                   --> [float]  Binary fraction used by COMPAS
+
+            =======================================================================
+            == Arguments for creating metallicity distribution and probabilities ==
+            =======================================================================
+            mu0                    --> [float]  metallicity dist: expected value at redshift 0
+            muz                    --> [float]  metallicity dist: redshift evolution of expected value
+            sigma0                 --> [float]  metallicity dist: width at redshhift 0
+            sigmaz                 --> [float]  metallicity dist: redshift evolution of width
+            alpha                  --> [float]  metallicity dist: skewness (0 = lognormal)
+            min_logZ               --> [float]  Minimum logZ at which to calculate dPdlogZ
+            max_logZ               --> [float]  Maximum logZ at which to calculate dPdlogZ
+            step_logZ              --> [float]  Size of logZ steps to take in finding a Z range
+
+            =======================================================
+            == Arguments for determining detection probabilities ==
+            =======================================================
+            sensitivity            --> [string] Which detector sensitivity to use: one of ["design", "O1", "O3"]
+            snr_threshold          --> [float]  What SNR threshold required for a detection
+            Mc_max                 --> [float]  Maximum chirp mass in grid
+            Mc_step                --> [float]  Step in chirp mass to use in grid
+            eta_max                --> [float]  Maximum symmetric mass ratio in grid
+            eta_step               --> [float]  Step in symmetric mass ratio to use in grid
+            snr_max                --> [float]  Maximum snr in grid
+            snr_step               --> [float]  Step in snr to use in grid
+
+            =====================================================
+            == Arguments for non-lognormal MSSFR prescriptions ==
+            =====================================================
+            NOTE: These were all added by Adam
+            lognormal              --> [bool]   Whether the MSSFR is lognormal
+            SFRprescription        --> [string] The SFRD prescription
+            GSMFprescription       --> [string] The GSMF prescription
+            ZMprescription         --> [string] The M-Z relation prescription
+
+
+        Returns:
+            detection_rate         --> [2D float array] Detection rate for each binary at each redshift in 1/yr
+            formation_rate         --> [2D float array] Formation rate for each binary at each redshift in 1/yr/Gpc^3
+            merger_rate            --> [2D float array] Merger rate for each binary at each redshift in 1/yr/Gpc^3
+            redshifts              --> [list of floats] List of redshifts
+            COMPAS                 --> [Object]         Relevant COMPAS data in COMPASData Class
+    """
+
+    # assert that input will not produce errors
+    assert max_redshift_detection <= max_redshift, "Maximum detection redshift cannot be below maximum redshift"
+    assert m1_min <= m1_max, "Minimum sampled primary mass cannot be above maximum sampled primary mass"
+    assert np.logical_and(fbin >= 0.0, fbin <= 1.0), "Binary fraction must be between 0 and 1"
+    assert Mc_step < Mc_max, "Chirp mass step size must be less than maximum chirp mass"
+    assert eta_step < eta_max, "Symmetric mass ratio step size must be less than maximum symmetric mass ratio"
+    assert snr_step < snr_max, "SNR step size must be less than maximum SNR"
+
+    nonnegative_args = [(max_redshift, "max_redshift"), (max_redshift_detection, "max_redshift_detection"), (m1_min.value, "m1_min"), (m1_max.value, "m1_max"),
+                        (m2_min.value, "m2_min"), (mu0, "mu0"), (sigma0, "sigma0"),  
+                        (step_logZ, "step_logZ"), (snr_threshold, "snr_threshold"), (Mc_max, "Mc_max"),
+                        (Mc_step, "Mc_step"), (eta_max, "eta_max"), (eta_step, "eta_step"), (snr_max, "snr_max"), (snr_step, "snr_step")]
+
+
+    for arg, arg_str in nonnegative_args:
+        assert arg >= 0.0, "{} must be nonnegative".format(arg_str)
+
+    # warn if input is not advisable
+    if redshift_step > max_redshift_detection:
+        warnings.warn("Redshift step is greater than maximum detection redshift", stacklevel=2)
+    if Mc_step > 1.0:
+        warnings.warn("Chirp mass step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+    if eta_step > 0.1:
+        warnings.warn("Symmetric mass ratio step is greater than 0.1, large step sizes can produce unpredictable results", stacklevel=2)
+    if snr_step > 1.0:
+        warnings.warn("SNR step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+
+    # start by getting the necessary data from the COMPAS file
+    COMPAS = ClassCOMPAS.COMPASData(path, Mlower=m1_min, Mupper=m1_max, m2_min=m2_min, binaryFraction=fbin, suppress_reminder=True)
+    COMPAS.setCOMPASDCOmask(types=dco_type, withinHubbleTime=merges_hubble_time, pessimistic=pessimistic_CEE, noRLOFafterCEE=no_RLOF_after_CEE)
+    COMPAS.setCOMPASData()
+    COMPAS.set_sw_weights(weight_column)
+    m1=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(1)");
+    m2=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(2)");
+    if use_sampled_mass_ranges:
+        COMPAS.Mlower=min(m1[m1!=m2])*u.Msun    # the m1!=m2 ensures we don't include masses set equal through RLOF at ZAMS
+        COMPAS.Mupper=max(m1)*u.Msun
+        COMPAS.m2_min=min(m2)*u.Msun
+    COMPAS.find_star_forming_mass_per_binary_sampling()
+
+
+    # compute the chirp masses and symmetric mass ratios only for systems of interest
+    chirp_masses = (COMPAS.mass1[mask]*COMPAS.mass2[mask])**(3/5) / (COMPAS.mass1[mask] + COMPAS.mass2[mask])**(1/5)
+    etas = COMPAS.mass1[mask] * COMPAS.mass2[mask] / (COMPAS.mass1[mask] + COMPAS.mass2[mask])**2
+    n_binaries = len(chirp_masses)
+    # another warning on poor input
+    if max(chirp_masses)*(1+max_redshift_detection) > Mc_max:
+        warnings.warn("Maximum chirp mass used for detectability calculation is below maximum binary chirp mass * (1+maximum redshift for detectability calculation)", stacklevel=2)
+
+    # calculate the redshifts array and its equivalents
+    redshifts, n_redshifts_detection, times, time_first_SF, distances, shell_volumes = calculate_redshift_related_params(max_redshift, max_redshift_detection, redshift_step, z_first_SF)
+    
+    # Check if the MSSFR prescription is lognormal or not
+    if lognormal:
+
+        # work out the metallicity distribution at each redshift and probability of drawing each metallicity in COMPAS
+        if np.log(np.min(COMPAS.initialZ[mask])) != np.log(np.max(COMPAS.initialZ[mask])): # Will perform integral over metallicities
+            dPdlogZ, metallicities, p_draw_metallicity = find_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ[mask])),
+                                                                                    max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ[mask])),
+                                                                                    mu0=mu0, muz=muz, sigma_0=sigma0, sigma_z=sigmaz, alpha = alpha,
+                                                                                    min_logZ=min_logZ, max_logZ=max_logZ, step_logZ = step_logZ)
+        else:
+            metallicities = None
+            dPdlogZ = 1
+            p_draw_metallicity = 1
+    
+        # find the star forming mass per year per Gpc^3 and convert to total number formed per year per Gpc^3
+        sfr = find_sfr(redshifts, a = aSF, b = bSF, c = cSF, d = dSF) # functional form from Madau & Dickinson 2014
+
+    else:
+        # work out the metallicity distribution at each redshift, probability of drawing each metallicity in COMPAS, and find the total number formed per year per Gpc^3
+        dPdlogZ, metallicities, p_draw_metallicity, sfr = find_prescribed_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ[mask])), 
+                                                max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ[mask])), min_logZ=min_logZ, max_logZ=max_logZ,
+                                                Zprescription=Zprescription, SFRprescription=SFRprescription, logNormalPrescription=logNormalPrescription, 
+                                                GSMFprescription=GSMFprescription, ZMprescription=ZMprescription)
+
+    # Calculate the representative SF mass
+    Average_SF_mass_needed = (COMPAS.mass_evolved_per_binary * COMPAS.n_systems)
+    print('Average_SF_mass_needed = ', Average_SF_mass_needed) # print this, because it might come in handy to know when writing up results :)
+    n_formed = sfr / Average_SF_mass_needed # Divide the star formation rate density by the representative SF mass    
+
+
+    # calculate the formation and merger rates using what we computed above
+    if COMPAS.sw_weights is None:
+        formation_rate, merger_rate = find_formation_and_merger_rates(n_binaries, redshifts, times, time_first_SF, n_formed, dPdlogZ,
+                                                                    metallicities, p_draw_metallicity, COMPAS.metallicitySystems[mask],
+                                                                    COMPAS.delayTimes[mask], COMPAS.sw_weights)
+    else: 
+        formation_rate, merger_rate = find_formation_and_merger_rates(n_binaries, redshifts, times, time_first_SF, n_formed, dPdlogZ,
+                                                                    metallicities, p_draw_metallicity, COMPAS.metallicitySystems[mask],
+                                                                    COMPAS.delayTimes[mask], COMPAS.sw_weights[mask])
+
+    # create lookup tables for the SNR at 1Mpc as a function of the masses and the probability of detection as a function of SNR
+    snr_grid_at_1Mpc, detection_probability_from_snr = compute_snr_and_detection_grids(sensitivity, snr_threshold, Mc_max, Mc_step,
+                                                                                    eta_max, eta_step, snr_max, snr_step)
+
+    # use lookup tables to find the probability of detecting each binary at each redshift
+    detection_probability = find_detection_probability(chirp_masses, etas, redshifts, distances, n_redshifts_detection, n_binaries,
+                                                        snr_grid_at_1Mpc, detection_probability_from_snr, Mc_step, eta_step, snr_step)
+
+    # finally, compute the detection rate using Neijssel+19 Eq. 2
+    detection_rate = np.zeros(shape=(n_binaries, n_redshifts_detection))
+    detection_rate = merger_rate[:, :n_redshifts_detection] * detection_probability \
+                    * shell_volumes[:n_redshifts_detection] / (1 + redshifts[:n_redshifts_detection])
+
+    
+    if(merger_output_filename!=None): # Store merger rates in an output text file if specified
+        with open(path+merger_output_filename, 'w') as output:
+            output.write('Mass1atMerger \t Mass2atMerger \t MergerRedshift \t MergerRate \n')
+            output.write('Msun \t Msun \t -- \t Gpc^{-3} yr^{-1} \n')
+            for i in range(n_redshifts_detection):
+                for j in range(n_binaries):
+                    if(merger_rate[j][i]>0):
+                        output.write(f'{COMPAS.mass1[mask][j]:.5f}\t{COMPAS.mass2[mask][j]:.5f}\t{redshifts[i]:.5f}\t{merger_rate[j][i]:.10f}\n')
+    
+    # Get total rates
+    total_detection_rate    = np.sum(detection_rate, axis=0)
+    total_formation_rate    = np.sum(formation_rate, axis=0)
+    total_merger_rate       = np.sum(merger_rate, axis=0)
+
+    # Get cumulative detection rate
+    cumulative_detection_rate = np.cumsum(total_detection_rate)
+    detection_rates_by_binary = np.sum(detection_rate, axis=1)
+
+    # Get the Hist
+    hist, _ = np.histogram(chirp_masses, weights = detection_rates_by_binary, bins=Mc_bins)
+    
+    # Calculate KDE
+    axis = np.arange(Mc_bins[0],Mc_bins[-1],0.1) # The x-axis for the chirp masses
+    # Get the KDE
+    mass_kde = FFTKDE(bw=0.2).fit(chirp_masses, weights=detection_rates_by_binary).evaluate(axis)
+    # Normalize the KDE
+    mass_kde_scaled = mass_kde*sum(hist)*sum(hist)*np.diff(Mc_bins)[0]
+    
+    # Clean out garbage
+    del detection_rate
+    del formation_rate
+    del merger_rate
+    del total_detection_rate
+
+    return cumulative_detection_rate, total_formation_rate, total_merger_rate, mass_kde_scaled
+
+
+def find_detection_rates_CIs(COMPAS, n_iters, calculation_kwargs, Mc_bins, return_iterations=False):
+
+    # Get the seeds for the DCO type
+    dco_seeds = COMPAS.seedsDCO
+
+    # Get the number of binaries of the DCO type in the data
+    num_binaries = len(dco_seeds)
+
+    # Declare the object to get results from
+    results_obj = []
+    cumulative_detection_rates  = []
+    total_formation_rates       = []
+    total_merger_rates          = []
+    mass_kde                    = []
+
+    # Declare a pool for multiprocessing
+    with Pool(processes=os.cpu_count() - 2) as pool:
+
+        # Iterate through different bootstrap iterations
+        for _ in range(n_iters):
+
+            # Make a mask that randomly draws from the data for the DCOs that you have
+            mask = np.random.randint(low=0, high=num_binaries, size=num_binaries)
+
+            # Assign the task and append the result to the results object
+            result = pool.apply_async(find_sampled_detection_rates, (COMPAS.path, mask, Mc_bins), calculation_kwargs)
+            results_obj.append(result)
+        
+        # Get the results
+        # results = []
+        for result in results_obj:
+            vals = result.get()
+            cumulative_detection_rates.append(vals[0])
+            total_formation_rates.append(vals[1])
+            total_merger_rates.append(vals[2])
+            mass_kde.append(vals[3])
+            
+            del vals
+            del result
+
+    # Sort the results into their own arrays 
+    cumulative_detection_rates  = np.array(cumulative_detection_rates, copy=True)
+    total_formation_rates       = np.array(total_formation_rates, copy=True)
+    total_merger_rates          = np.array(total_merger_rates, copy=True)
+    mass_kde                    = np.array(mass_kde, copy=True)
+
+    # Clear out trash
+    del results_obj
+    
+    # Dictionaries to have the confidence intervals in
+    one_sigma = {}
+    two_sigma = {}
+
+    # Get the one sigma confidence intervals
+    one_sigma['total_formation_rates']          =   np.percentile(total_formation_rates, [16, 84], axis=0)
+    one_sigma['total_merger_rates']             =   np.percentile(total_merger_rates, [16, 84], axis=0)
+    one_sigma['cumulative_detection_rates']     =   np.percentile(cumulative_detection_rates, [16, 84], axis=0)
+    one_sigma['mass_kde']                       =   np.percentile(mass_kde, [16, 84], axis=0)
+
+    # Get the two sigma confidence intervals
+    two_sigma['total_formation_rates']          =   np.percentile(total_formation_rates, [2.5, 97.5], axis=0)
+    two_sigma['total_merger_rates']             =   np.percentile(total_merger_rates, [2.5, 97.5], axis=0)
+    two_sigma['cumulative_detection_rates']     =   np.percentile(cumulative_detection_rates, [2.5, 97.5], axis=0)
+    two_sigma['mass_kde']                       =   np.percentile(mass_kde, [2.5, 97.5], axis=0)
+
+    # Return data! If we want to return the bootstrap iterations, return all the rates too
+    if return_iterations:
+        return one_sigma, two_sigma, cumulative_detection_rates, total_formation_rates, total_merger_rates, chirp_masses
+    else:
+        # Clear out trash
+        del total_formation_rates
+        del total_merger_rates
+        del cumulative_detection_rates
+        del mass_kde
+
+        return one_sigma, two_sigma
+
+def find_detection_rate_by_metallicity(path, bin_edges, dco_type="BBH", merger_output_filename=None, weight_column=None,
+                        merges_hubble_time=True, pessimistic_CEE=True, no_RLOF_after_CEE=True,
+                        max_redshift=10.0, max_redshift_detection=1.0, redshift_step=0.001, z_first_SF = 10,
+                        use_sampled_mass_ranges=True, m1_min=5 * u.Msun, m1_max=150 * u.Msun, m2_min=0.1 * u.Msun, fbin=0.7,
+                        aSF = 0.01, bSF = 2.77, cSF = 2.90, dSF = 4.70,
+                        mu0=0.035, muz=-0.23, sigma0=0.39,sigmaz=0., alpha=0.0, 
+                        min_logZ=-12.0, max_logZ=0.0, step_logZ=0.01,
+                        sensitivity="O1", snr_threshold=8, 
+                        Mc_max=300.0, Mc_step=0.1, eta_max=0.25, eta_step=0.01,
+                        snr_max=1000.0, snr_step=0.1,
+                        lognormal=False, Zprescription='MZ_GSMF', SFRprescription='Madau et al. (2017)',                    # ADDED BY ADAM
+                        GSMFprescription='Panter et al. (2004) Single', ZMprescription='Langer et al. +offset (2006)',      # ADDED BY ADAM
+                        logNormalPrescription=None):                                                                        # ADDED BY ADAM
+    """
+        The main function of this file. Finds the detection rate, formation rate and merger rate for each
+        binary in a COMPAS file at a series of redshifts defined by intput. Also returns relevant COMPAS
+        data.
+
+        NOTE: This code assumes that assumes that metallicities in COMPAS are drawn from a flat in log distribution
+
+        Args:
+            ===================================================
+            == Arguments for finding and masking COMPAS file ==
+            ===================================================
+            path                   --> [string] Path to the COMPAS data file that contains the output
+            channel_type           --> [int]    the number channel that we will calculate the rates for
+            dco_type               --> [string] Which DCO type to calculate rates for: one of ["all", "BBH", "BHNS", "BNS"]
+            merger_output_filename --> [string] Optional name of output file to store merging DCOs (do not create the extra output if None)
+            weight_column          --> [string] Name of column in "DoubleCompactObjects" file that contains adaptive sampling weights
+                                                    (Leave this as None if you have unweighted samples)
+            merges_in_hubble_time  --> [bool]   whether to mask binaries that don't merge in a Hubble time
+            no_RLOF_after_CEE      --> [bool]   whether to mask binaries that have immediate RLOF after a CCE
+            pessimistic_CEE        --> [bool]   whether to mask binaries that go through Optimistic CE scenario
+
+            ===========================================
+            == Arguments for creating redshift array ==
+            ===========================================
+            max_redshift           --> [float]  Maximum redshift to use in array
+            max_redshift_detection --> [float]  Maximum redshift to calculate detection rates (must be <= max_redshift)
+            redshift_step          --> [float]  Size of step to take in redshift
+
+            ====================================================================
+            == Arguments for determining star forming mass per sampled binary ==
+            ====================================================================
+            use_sampled_mass_ranges--> [bool]   whether to use the min and max m1 and m2 samples in lieu of hard cutoffs as below
+            m1_min                 --> [float]  Minimum primary mass sampled by COMPAS
+            m1_max                 --> [float]  Maximum primary mass sampled by COMPAS
+            m2_min                 --> [float]  Minimum secondary mass sampled by COMPAS
+            fbin                   --> [float]  Binary fraction used by COMPAS
+
+            =======================================================================
+            == Arguments for creating metallicity distribution and probabilities ==
+            =======================================================================
+            mu0                    --> [float]  metallicity dist: expected value at redshift 0
+            muz                    --> [float]  metallicity dist: redshift evolution of expected value
+            sigma0                 --> [float]  metallicity dist: width at redshhift 0
+            sigmaz                 --> [float]  metallicity dist: redshift evolution of width
+            alpha                  --> [float]  metallicity dist: skewness (0 = lognormal)
+            min_logZ               --> [float]  Minimum logZ at which to calculate dPdlogZ
+            max_logZ               --> [float]  Maximum logZ at which to calculate dPdlogZ
+            step_logZ              --> [float]  Size of logZ steps to take in finding a Z range
+
+            =======================================================
+            == Arguments for determining detection probabilities ==
+            =======================================================
+            sensitivity            --> [string] Which detector sensitivity to use: one of ["design", "O1", "O3"]
+            snr_threshold          --> [float]  What SNR threshold required for a detection
+            Mc_max                 --> [float]  Maximum chirp mass in grid
+            Mc_step                --> [float]  Step in chirp mass to use in grid
+            eta_max                --> [float]  Maximum symmetric mass ratio in grid
+            eta_step               --> [float]  Step in symmetric mass ratio to use in grid
+            snr_max                --> [float]  Maximum snr in grid
+            snr_step               --> [float]  Step in snr to use in grid
+
+            =====================================================
+            == Arguments for non-lognormal MSSFR prescriptions ==
+            =====================================================
+            NOTE: These were all added by Adam
+            lognormal              --> [bool]   Whether the MSSFR is lognormal
+            SFRprescription        --> [string] The SFRD prescription
+            GSMFprescription       --> [string] The GSMF prescription
+            ZMprescription         --> [string] The M-Z relation prescription
+
+
+        Returns:
+            detection_rate         --> [2D float array] Detection rate for each binary at each redshift in 1/yr
+            formation_rate         --> [2D float array] Formation rate for each binary at each redshift in 1/yr/Gpc^3
+            merger_rate            --> [2D float array] Merger rate for each binary at each redshift in 1/yr/Gpc^3
+            redshifts              --> [list of floats] List of redshifts
+            COMPAS                 --> [Object]         Relevant COMPAS data in COMPASData Class
+    """
+
+    # assert that input will not produce errors
+    assert max_redshift_detection <= max_redshift, "Maximum detection redshift cannot be below maximum redshift"
+    assert m1_min <= m1_max, "Minimum sampled primary mass cannot be above maximum sampled primary mass"
+    assert np.logical_and(fbin >= 0.0, fbin <= 1.0), "Binary fraction must be between 0 and 1"
+    assert Mc_step < Mc_max, "Chirp mass step size must be less than maximum chirp mass"
+    assert eta_step < eta_max, "Symmetric mass ratio step size must be less than maximum symmetric mass ratio"
+    assert snr_step < snr_max, "SNR step size must be less than maximum SNR"
+
+    nonnegative_args = [(max_redshift, "max_redshift"), (max_redshift_detection, "max_redshift_detection"), (m1_min.value, "m1_min"), (m1_max.value, "m1_max"),
+                        (m2_min.value, "m2_min"), (mu0, "mu0"), (sigma0, "sigma0"),  
+                        (step_logZ, "step_logZ"), (snr_threshold, "snr_threshold"), (Mc_max, "Mc_max"),
+                        (Mc_step, "Mc_step"), (eta_max, "eta_max"), (eta_step, "eta_step"), (snr_max, "snr_max"), (snr_step, "snr_step")]
+
+
+    for arg, arg_str in nonnegative_args:
+        assert arg >= 0.0, "{} must be nonnegative".format(arg_str)
+
+    # warn if input is not advisable
+    if redshift_step > max_redshift_detection:
+        warnings.warn("Redshift step is greater than maximum detection redshift", stacklevel=2)
+    if Mc_step > 1.0:
+        warnings.warn("Chirp mass step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+    if eta_step > 0.1:
+        warnings.warn("Symmetric mass ratio step is greater than 0.1, large step sizes can produce unpredictable results", stacklevel=2)
+    if snr_step > 1.0:
+        warnings.warn("SNR step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+
+    # start by getting the necessary data from the COMPAS file
+    COMPAS = ClassCOMPAS.COMPASData(path, Mlower=m1_min, Mupper=m1_max, m2_min=m2_min, binaryFraction=fbin, suppress_reminder=True)
+    COMPAS.setCOMPASDCOmask(types=dco_type, withinHubbleTime=merges_hubble_time, pessimistic=pessimistic_CEE, noRLOFafterCEE=no_RLOF_after_CEE)
+    COMPAS.setCOMPASData()
+    COMPAS.set_sw_weights(weight_column)
+    
+    # Mak masks to filer for the channel only
+    all_seeds, Zs = COMPAS.get_COMPAS_variables("BSE_System_Parameters", ["SEED", "Metallicity@ZAMS(1)"])
+    dco_seeds = COMPAS.get_COMPAS_variables("BSE_Double_Compact_Objects",["SEED"])
+    dco_mask = np.isin(all_seeds, dco_seeds)
+
+    # A mask for all the
+    Z_mask = np.logical_and(Zs[dco_mask][COMPAS.DCOmask] >= bin_edges[0], Zs[dco_mask][COMPAS.DCOmask] < bin_edges[1])
+    print(Z_mask)
+    if np.all(Z_mask == False):
+        print('There are no binaries with delay times in the bin ', bin_edges)
+        return None, None, None, None, None
+    else:
+        m1=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(1)")
+        m2=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(2)")
+        if use_sampled_mass_ranges:
+            COMPAS.Mlower=min(m1[m1!=m2])*u.Msun    # the m1!=m2 ensures we don't include masses set equal through RLOF at ZAMS
+            COMPAS.Mupper=max(m1)*u.Msun
+            COMPAS.m2_min=min(m2)*u.Msun
+        COMPAS.find_star_forming_mass_per_binary_sampling()
+
+        # compute the chirp masses and symmetric mass ratios only for systems of interest
+        print(len(COMPAS.mass1))
+        print(len(Z_mask))
+        chirp_masses = (COMPAS.mass1[Z_mask]*COMPAS.mass2[Z_mask])**(3/5) / (COMPAS.mass1[Z_mask] + COMPAS.mass2[Z_mask])**(1/5)
+        n_binaries = len(chirp_masses)
+        # another warning on poor input
+        if max(chirp_masses)*(1+max_redshift_detection) > Mc_max:
+            warnings.warn("Maximum chirp mass used for detectability calculation is below maximum binary chirp mass * (1+maximum redshift for detectability calculation)", stacklevel=2)
+
+        # calculate the redshifts array and its equivalents
+        redshifts, n_redshifts_detection, times, time_first_SF, distances, shell_volumes = calculate_redshift_related_params(max_redshift, max_redshift_detection, redshift_step, z_first_SF)
+        
+        # Check if the MSSFR prescription is lognormal or not
+        if lognormal:
+
+            # work out the metallicity distribution at each redshift and probability of drawing each metallicity in COMPAS
+            if np.log(np.min(COMPAS.initialZ)) != np.log(np.max(COMPAS.initialZ)): # Will perform integral over metallicities
+                dPdlogZ, metallicities, p_draw_metallicity = find_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)),
+                                                                                        max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)),
+                                                                                        mu0=mu0, muz=muz, sigma_0=sigma0, sigma_z=sigmaz, alpha = alpha,
+                                                                                        min_logZ=min_logZ, max_logZ=max_logZ, step_logZ = step_logZ)
+            else:
+                metallicities = None
+                dPdlogZ = 1
+                p_draw_metallicity = 1
+        
+            # find the star forming mass per year per Gpc^3 and convert to total number formed per year per Gpc^3
+            sfr = find_sfr(redshifts, a = aSF, b = bSF, c = cSF, d = dSF) # functional form from Madau & Dickinson 2014
+
+        else:
+            # work out the metallicity distribution at each redshift, probability of drawing each metallicity in COMPAS, and find the total number formed per year per Gpc^3
+            dPdlogZ, metallicities, p_draw_metallicity, sfr = find_prescribed_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)), 
+                                                    max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)), min_logZ=min_logZ, max_logZ=max_logZ,
+                                                    Zprescription=Zprescription, SFRprescription=SFRprescription, logNormalPrescription=logNormalPrescription, 
+                                                    GSMFprescription=GSMFprescription, ZMprescription=ZMprescription)
+
+        # Calculate the representative SF mass
+        Average_SF_mass_needed = (COMPAS.mass_evolved_per_binary * COMPAS.n_systems)
+        print('Average_SF_mass_needed = ', Average_SF_mass_needed) # print this, because it might come in handy to know when writing up results :)
+        n_formed = sfr / Average_SF_mass_needed # Divide the star formation rate density by the representative SF mass    
+
+
+        # calculate the formation and merger rates using what we computed above
+        formation_rate, merger_rate = find_formation_and_merger_rates(n_binaries, redshifts, times, time_first_SF, n_formed, dPdlogZ,
+                                                                        metallicities, p_draw_metallicity, COMPAS.metallicitySystems[Z_mask],
+                                                                        COMPAS.delayTimes[Z_mask], COMPAS.sw_weights) # If we are using sw_weights, we must add: [sps_channel_mask])
+
+        # create lookup tables for the SNR at 1Mpc as a function of the masses and the probability of detection as a function of SNR
+        snr_grid_at_1Mpc, detection_probability_from_snr = compute_snr_and_detection_grids(sensitivity, snr_threshold, Mc_max, Mc_step,
+                                                                                        eta_max, eta_step, snr_max, snr_step)
+
+        etas = COMPAS.mass1[Z_mask] * COMPAS.mass2[Z_mask] / (COMPAS.mass1[Z_mask] + COMPAS.mass2[Z_mask])**2
+        # use lookup tables to find the probability of detecting each binary at each redshift
+        detection_probability = find_detection_probability(chirp_masses, etas, redshifts, distances, n_redshifts_detection, n_binaries,
+                                                            snr_grid_at_1Mpc, detection_probability_from_snr, Mc_step, eta_step, snr_step)
+
+
+        # finally, compute the detection rate using Neijssel+19 Eq. 2
+        detection_rate = np.zeros(shape=(n_binaries, n_redshifts_detection))
+        detection_rate = merger_rate[:, :n_redshifts_detection] * detection_probability \
+                        * shell_volumes[:n_redshifts_detection] / (1 + redshifts[:n_redshifts_detection])
+
+        
+        if(merger_output_filename!=None): # Store merger rates in an output text file if specified
+            with open(path+merger_output_filename, 'w') as output:
+                output.write('Mass1atMerger \t Mass2atMerger \t MergerRedshift \t MergerRate \n')
+                output.write('Msun \t Msun \t -- \t Gpc^{-3} yr^{-1} \n')
+                for i in range(n_redshifts_detection):
+                    for j in range(n_binaries):
+                        if(merger_rate[j][i]>0):
+                            output.write(f'{COMPAS.mass1[j]:.5f}\t{COMPAS.mass2[j]:.5f}\t{redshifts[i]:.5f}\t{merger_rate[j][i]:.10f}\n')
+        
+        return detection_rate, formation_rate, merger_rate, redshifts, COMPAS
+
+
+
+
+
+
+
+
+def find_rate_weights_at_redshifts(path, desired_redshifts, dco_type="BBH", merger_output_filename=None, weight_column=None,
+                        merges_hubble_time=True, pessimistic_CEE=True, no_RLOF_after_CEE=True,
+                        max_redshift=10.0, max_redshift_detection=1.0, redshift_step=0.001, z_first_SF = 10,
+                        use_sampled_mass_ranges=True, m1_min=5 * u.Msun, m1_max=150 * u.Msun, m2_min=0.1 * u.Msun, fbin=0.7,
+                        aSF = 0.01, bSF = 2.77, cSF = 2.90, dSF = 4.70,
+                        mu0=0.035, muz=-0.23, sigma0=0.39,sigmaz=0., alpha=0.0, 
+                        min_logZ=-12.0, max_logZ=0.0, step_logZ=0.01,
+                        sensitivity="O1", snr_threshold=8, 
+                        Mc_max=300.0, Mc_step=0.1, eta_max=0.25, eta_step=0.01,
+                        snr_max=1000.0, snr_step=0.1,
+                        lognormal=False, Zprescription='MZ_GSMF', SFRprescription='Madau et al. (2017)',                    # ADDED BY ADAM
+                        GSMFprescription='Panter et al. (2004) Single', ZMprescription='Langer et al. +offset (2006)',      # ADDED BY ADAM
+                        logNormalPrescription=None):                                                                        # ADDED BY ADAM
+    """
+        The main function of this file. Finds the detection rate, formation rate and merger rate for each
+        binary in a COMPAS file at a series of redshifts defined by intput. Also returns relevant COMPAS
+        data.
+
+        NOTE: This code assumes that assumes that metallicities in COMPAS are drawn from a flat in log distribution
+
+        Args:
+            ===================================================
+            == Arguments for finding and masking COMPAS file ==
+            ===================================================
+            path                   --> [string] Path to the COMPAS data file that contains the output
+            channel_type           --> [int]    the number channel that we will calculate the rates for
+            dco_type               --> [string] Which DCO type to calculate rates for: one of ["all", "BBH", "BHNS", "BNS"]
+            merger_output_filename --> [string] Optional name of output file to store merging DCOs (do not create the extra output if None)
+            weight_column          --> [string] Name of column in "DoubleCompactObjects" file that contains adaptive sampling weights
+                                                    (Leave this as None if you have unweighted samples)
+            merges_in_hubble_time  --> [bool]   whether to mask binaries that don't merge in a Hubble time
+            no_RLOF_after_CEE      --> [bool]   whether to mask binaries that have immediate RLOF after a CCE
+            pessimistic_CEE        --> [bool]   whether to mask binaries that go through Optimistic CE scenario
+
+            ===========================================
+            == Arguments for creating redshift array ==
+            ===========================================
+            max_redshift           --> [float]  Maximum redshift to use in array
+            max_redshift_detection --> [float]  Maximum redshift to calculate detection rates (must be <= max_redshift)
+            redshift_step          --> [float]  Size of step to take in redshift
+
+            ====================================================================
+            == Arguments for determining star forming mass per sampled binary ==
+            ====================================================================
+            use_sampled_mass_ranges--> [bool]   whether to use the min and max m1 and m2 samples in lieu of hard cutoffs as below
+            m1_min                 --> [float]  Minimum primary mass sampled by COMPAS
+            m1_max                 --> [float]  Maximum primary mass sampled by COMPAS
+            m2_min                 --> [float]  Minimum secondary mass sampled by COMPAS
+            fbin                   --> [float]  Binary fraction used by COMPAS
+
+            =======================================================================
+            == Arguments for creating metallicity distribution and probabilities ==
+            =======================================================================
+            mu0                    --> [float]  metallicity dist: expected value at redshift 0
+            muz                    --> [float]  metallicity dist: redshift evolution of expected value
+            sigma0                 --> [float]  metallicity dist: width at redshhift 0
+            sigmaz                 --> [float]  metallicity dist: redshift evolution of width
+            alpha                  --> [float]  metallicity dist: skewness (0 = lognormal)
+            min_logZ               --> [float]  Minimum logZ at which to calculate dPdlogZ
+            max_logZ               --> [float]  Maximum logZ at which to calculate dPdlogZ
+            step_logZ              --> [float]  Size of logZ steps to take in finding a Z range
+
+            =======================================================
+            == Arguments for determining detection probabilities ==
+            =======================================================
+            sensitivity            --> [string] Which detector sensitivity to use: one of ["design", "O1", "O3"]
+            snr_threshold          --> [float]  What SNR threshold required for a detection
+            Mc_max                 --> [float]  Maximum chirp mass in grid
+            Mc_step                --> [float]  Step in chirp mass to use in grid
+            eta_max                --> [float]  Maximum symmetric mass ratio in grid
+            eta_step               --> [float]  Step in symmetric mass ratio to use in grid
+            snr_max                --> [float]  Maximum snr in grid
+            snr_step               --> [float]  Step in snr to use in grid
+
+            =====================================================
+            == Arguments for non-lognormal MSSFR prescriptions ==
+            =====================================================
+            NOTE: These were all added by Adam
+            lognormal              --> [bool]   Whether the MSSFR is lognormal
+            SFRprescription        --> [string] The SFRD prescription
+            GSMFprescription       --> [string] The GSMF prescription
+            ZMprescription         --> [string] The M-Z relation prescription
+
+
+        Returns:
+            detection_rate         --> [2D float array] Detection rate for each binary at each redshift in 1/yr
+            formation_rate         --> [2D float array] Formation rate for each binary at each redshift in 1/yr/Gpc^3
+            merger_rate            --> [2D float array] Merger rate for each binary at each redshift in 1/yr/Gpc^3
+            redshifts              --> [list of floats] List of redshifts
+            COMPAS                 --> [Object]         Relevant COMPAS data in COMPASData Class
+    """
+
+    # assert that input will not produce errors
+    assert max_redshift_detection <= max_redshift, "Maximum detection redshift cannot be below maximum redshift"
+    assert m1_min <= m1_max, "Minimum sampled primary mass cannot be above maximum sampled primary mass"
+    assert np.logical_and(fbin >= 0.0, fbin <= 1.0), "Binary fraction must be between 0 and 1"
+    assert Mc_step < Mc_max, "Chirp mass step size must be less than maximum chirp mass"
+    assert eta_step < eta_max, "Symmetric mass ratio step size must be less than maximum symmetric mass ratio"
+    assert snr_step < snr_max, "SNR step size must be less than maximum SNR"
+
+    nonnegative_args = [(max_redshift, "max_redshift"), (max_redshift_detection, "max_redshift_detection"), (m1_min.value, "m1_min"), (m1_max.value, "m1_max"),
+                        (m2_min.value, "m2_min"), (mu0, "mu0"), (sigma0, "sigma0"),  
+                        (step_logZ, "step_logZ"), (snr_threshold, "snr_threshold"), (Mc_max, "Mc_max"),
+                        (Mc_step, "Mc_step"), (eta_max, "eta_max"), (eta_step, "eta_step"), (snr_max, "snr_max"), (snr_step, "snr_step")]
+
+
+    for arg, arg_str in nonnegative_args:
+        assert arg >= 0.0, "{} must be nonnegative".format(arg_str)
+
+    # warn if input is not advisable
+    if redshift_step > max_redshift_detection:
+        warnings.warn("Redshift step is greater than maximum detection redshift", stacklevel=2)
+    if Mc_step > 1.0:
+        warnings.warn("Chirp mass step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+    if eta_step > 0.1:
+        warnings.warn("Symmetric mass ratio step is greater than 0.1, large step sizes can produce unpredictable results", stacklevel=2)
+    if snr_step > 1.0:
+        warnings.warn("SNR step is greater than 1.0, large step sizes can produce unpredictable results", stacklevel=2)
+
+    # start by getting the necessary data from the COMPAS file
+    COMPAS = ClassCOMPAS.COMPASData(path, Mlower=m1_min, Mupper=m1_max, m2_min=m2_min, binaryFraction=fbin, suppress_reminder=True)
+    COMPAS.setCOMPASDCOmask(types=dco_type, withinHubbleTime=merges_hubble_time, pessimistic=pessimistic_CEE, noRLOFafterCEE=no_RLOF_after_CEE)
+    COMPAS.setCOMPASData()
+    COMPAS.set_sw_weights(weight_column)
+    m1=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(1)");
+    m2=COMPAS.get_COMPAS_variables("BSE_System_Parameters","Mass@ZAMS(2)");
+    if use_sampled_mass_ranges:
+        COMPAS.Mlower=min(m1[m1!=m2])*u.Msun    # the m1!=m2 ensures we don't include masses set equal through RLOF at ZAMS
+        COMPAS.Mupper=max(m1)*u.Msun
+        COMPAS.m2_min=min(m2)*u.Msun
+    COMPAS.find_star_forming_mass_per_binary_sampling()
+
+
+    # compute the chirp masses and symmetric mass ratios only for systems of interest
+    chirp_masses = (COMPAS.mass1*COMPAS.mass2)**(3/5) / (COMPAS.mass1 + COMPAS.mass2)**(1/5)
+    etas = COMPAS.mass1 * COMPAS.mass2 / (COMPAS.mass1 + COMPAS.mass2)**2
+    n_binaries = len(chirp_masses)
+    # another warning on poor input
+    if max(chirp_masses)*(1+max_redshift_detection) > Mc_max:
+        warnings.warn("Maximum chirp mass used for detectability calculation is below maximum binary chirp mass * (1+maximum redshift for detectability calculation)", stacklevel=2)
+
+    # calculate the redshifts array and its equivalents
+    redshifts, n_redshifts_detection, times, time_first_SF, distances, shell_volumes = calculate_redshift_related_params(max_redshift, max_redshift_detection, redshift_step, z_first_SF)
+    
+    # Check if the MSSFR prescription is lognormal or not
+    if lognormal:
+
+        # work out the metallicity distribution at each redshift and probability of drawing each metallicity in COMPAS
+        if np.log(np.min(COMPAS.initialZ)) != np.log(np.max(COMPAS.initialZ)): # Will perform integral over metallicities
+            dPdlogZ, metallicities, p_draw_metallicity = find_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)),
+                                                                                    max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)),
+                                                                                    mu0=mu0, muz=muz, sigma_0=sigma0, sigma_z=sigmaz, alpha = alpha,
+                                                                                    min_logZ=min_logZ, max_logZ=max_logZ, step_logZ = step_logZ)
+        else:
+            metallicities = None
+            dPdlogZ = 1
+            p_draw_metallicity = 1
+    
+        # find the star forming mass per year per Gpc^3 and convert to total number formed per year per Gpc^3
+        sfr = find_sfr(redshifts, a = aSF, b = bSF, c = cSF, d = dSF) # functional form from Madau & Dickinson 2014
+
+    else:
+        # work out the metallicity distribution at each redshift, probability of drawing each metallicity in COMPAS, and find the total number formed per year per Gpc^3
+        dPdlogZ, metallicities, p_draw_metallicity, sfr = find_prescribed_metallicity_distribution(redshifts, min_logZ_COMPAS = np.log(np.min(COMPAS.initialZ)), 
+                                                max_logZ_COMPAS = np.log(np.max(COMPAS.initialZ)), min_logZ=min_logZ, max_logZ=max_logZ,
+                                                Zprescription=Zprescription, SFRprescription=SFRprescription, logNormalPrescription=logNormalPrescription, 
+                                                GSMFprescription=GSMFprescription, ZMprescription=ZMprescription)
+
+    # Calculate the representative SF mass
+    Average_SF_mass_needed = (COMPAS.mass_evolved_per_binary * COMPAS.n_systems)
+    print('Average_SF_mass_needed = ', Average_SF_mass_needed) # print this, because it might come in handy to know when writing up results :)
+    n_formed = sfr / Average_SF_mass_needed # Divide the star formation rate density by the representative SF mass    
+
+
+    # calculate the formation and merger rates using what we computed above
+    formation_rate, merger_rate = find_formation_and_merger_rates(n_binaries, redshifts, times, time_first_SF, n_formed, dPdlogZ,
+                                                                    metallicities, p_draw_metallicity, COMPAS.metallicitySystems,
+                                                                    COMPAS.delayTimes, COMPAS.sw_weights)
+
+    # create lookup tables for the SNR at 1Mpc as a function of the masses and the probability of detection as a function of SNR
+    snr_grid_at_1Mpc, detection_probability_from_snr = compute_snr_and_detection_grids(sensitivity, snr_threshold, Mc_max, Mc_step,
+                                                                                    eta_max, eta_step, snr_max, snr_step)
+
+    if(merger_output_filename!=None): # Store merger rates in an output text file if specified
+        with open(path+merger_output_filename, 'w') as output:
+            output.write('Mass1atMerger \t Mass2atMerger \t MergerRedshift \t MergerRate \n')
+            output.write('Msun \t Msun \t -- \t Gpc^{-3} yr^{-1} \n')
+            for i in range(n_redshifts_detection):
+                for j in range(n_binaries):
+                    if(merger_rate[j][i]>0):
+                        output.write(f'{COMPAS.mass1[j]:.5f}\t{COMPAS.mass2[j]:.5f}\t{redshifts[i]:.5f}\t{merger_rate[j][i]:.10f}\n')
+        
+    # Create list of formation rates at the zs given by user
+    merger_rates = []
+    formation_rates = []
+    for desired_z in desired_redshifts:
+
+        # Get the argument of the rates at the z that we desire
+        arg_desired_z = np.where(redshifts == desired_z)[0][0]
+
+        # Append the rates at desired z to the list
+        merger_rate_at_z = merger_rate[:,arg_desired_z]
+        merger_rates.append(merger_rate_at_z)
+        formation_rate_at_z = formation_rate[:,arg_desired_z]
+        formation_rates.append(formation_rate_at_z)
+
+    return np.array(formation_rates), np.array(merger_rates), redshifts, COMPAS
+
 

@@ -9,16 +9,16 @@
 CPP := g++
 
 # gsl directories
-GSLINCDIR := /include
-GSLLIBDIR := /lib
+GSLINCDIR := /n/helmod/apps/centos7/Core/gsl/2.6-fasrc01/include
+GSLLIBDIR := /n/helmod/apps/centos7/Core/gsl/2.6-fasrc01/lib64
 
 # boost directories
-BOOSTINCDIR := /include
-BOOSTLIBDIR := /lib
+BOOSTINCDIR := /n/home04/aboesky/pgk/boost/include
+BOOSTLIBDIR := /n/home04/aboesky/pgk/boost/lib
 
 # hdf5 directories
-HDF5INCDIR := /usr/include/hdf5/serial
-HDF5LIBDIR := /usr/lib/x86_64-linux-gnu/hdf5/serial
+HDF5INCDIR := /n/helmod/apps/centos7/Core/hdf5/1.10.6-fasrc01/include
+HDF5LIBDIR := /n/helmod/apps/centos7/Core/hdf5/1.10.6-fasrc01/lib
 
 EXE := COMPAS
 

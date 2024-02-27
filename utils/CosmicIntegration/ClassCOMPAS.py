@@ -29,6 +29,8 @@ class COMPASData(object):
         # Crucial values I need for selection effects
         self.mass1 = None  # Msun
         self.mass2 = None  # Msun
+        self.Amin = None   # Minimum initial seperation for the simulations
+        self.Amax = None   # Maximum initial seperation for the simulations
         self.DCOmask = None
         self.allTypesMask = None
         self.BBHmask = None
@@ -143,6 +145,8 @@ class COMPASData(object):
             Mlower=self.Mlower,
             Mupper=self.Mupper,
             binaryFraction=self.binaryFraction,
+            Amin=self.Amin,
+            Amax=self.Amax
         )
         # Want to recover entire metallicity grid, assume that every metallicity
         # evolved shows in all systems again should not change within same run
